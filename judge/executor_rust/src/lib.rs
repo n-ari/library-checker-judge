@@ -2,15 +2,18 @@ use anyhow::{format_err, Error};
 use clap::{App, Arg};
 use libc::pid_t;
 use libc::{rlimit, setrlimit, RLIMIT_STACK, RLIM_INFINITY};
-use log::{info, warn, error};
+use log::{error, info, warn};
 
 #[cfg(feature = "sandbox")]
 use nix::mount::{mount, MsFlags};
 #[cfg(feature = "sandbox")]
 use nix::sched::{unshare, CloneFlags};
 
+use nix::fcntl::{open, OFlag};
 use nix::sys::signal::{kill, SIGKILL};
+use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::dup2;
 use nix::unistd::{chdir, chroot, close, execvp, fork, getpid, pipe, read, write, ForkResult, Pid};
 
 #[cfg(feature = "sandbox")]
@@ -231,21 +234,20 @@ fn execute_unshared(
         );
         if res != 0 {
             if cfg!(feature = "sandbox") {
-                return Err(format_err!("setrlimit(stack unlimited) failed"))
+                return Err(format_err!("setrlimit(stack unlimited) failed"));
             } else {
                 warn!("setrlimit(stack unlimited) failed")
             }
         }
     }
 
-
-    if cfg!(feature="sandbox") {
-        chdir(&temp_dir.join("root").join("sand"))?; 
+    if cfg!(feature = "sandbox") {
+        chdir(&temp_dir.join("root").join("sand"))?;
     } else {
         chdir(base_dir)?;
     }
 
-    if cfg!(feature="sandbox") {
+    if cfg!(feature = "sandbox") {
         chroot("..")?;
         change_uid()?;
         env::remove_var("TMPDIR");
@@ -258,6 +260,31 @@ fn execute_unshared(
         .map(|s| CString::new(s.clone()).unwrap())
         .collect();
     let args: Vec<&std::ffi::CStr> = args.iter().map(|s| &s[..]).collect();
+
+    if let Some(stdin) = app.value_of("stdin") {
+        let fd_in = open(stdin, OFlag::O_RDONLY, Mode::empty())?;
+        dup2(fd_in, 0)?;
+        close(fd_in)?;
+    }
+    if let Some(stdout) = app.value_of("stdout") {
+        let fd_out = open(
+            stdout,
+            OFlag::O_WRONLY | OFlag::O_TRUNC | OFlag::O_CREAT,
+            Mode::S_IRUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IWUSR,
+        )?;
+        dup2(fd_out, 1)?;
+        close(fd_out)?;
+    }
+    if let Some(stderr) = app.value_of("stderr") {
+        let fd_err = open(
+            stderr,
+            OFlag::O_WRONLY | OFlag::O_TRUNC | OFlag::O_CREAT,
+            Mode::S_IRUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IWUSR,
+        )?;
+        dup2(fd_err, 2)?;
+        close(fd_err)?;
+    }
+
     write(start_pipe_write, &[0])?;
     close(start_pipe_write)?;
     execvp(&program, &args[..])?;
@@ -416,7 +443,8 @@ fn execute(app: &clap::ArgMatches, user_args: &[String]) -> Result<ExecResult, E
                 result.time = tl;
             }
             result.memory = if cfg!(feature = "sandbox") {
-                let mem = read_to_string("/sys/fs/cgroup/memory/lib-judge/memory.max_usage_in_bytes")?;
+                let mem =
+                    read_to_string("/sys/fs/cgroup/memory/lib-judge/memory.max_usage_in_bytes")?;
                 mem.trim().parse()?
             } else {
                 0
@@ -445,6 +473,24 @@ pub fn execute_main(my_args: &[String], user_args: &[String]) -> Result<ExecResu
         .arg(
             Arg::with_name("result")
                 .long("result")
+                .takes_value(true)
+                .required(false),
+        )
+        .arg(
+            Arg::with_name("stdin")
+                .long("stdin")
+                .takes_value(true)
+                .required(false),
+        )
+        .arg(
+            Arg::with_name("stdout")
+                .long("stdout")
+                .takes_value(true)
+                .required(false),
+        )
+        .arg(
+            Arg::with_name("stderr")
+                .long("stderr")
                 .takes_value(true)
                 .required(false),
         )

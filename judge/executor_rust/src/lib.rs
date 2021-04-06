@@ -1,4 +1,4 @@
-use anyhow::{format_err, Error};
+use anyhow::{format_err, Context, Error};
 use clap::{App, Arg};
 use libc::pid_t;
 use libc::{rlimit, setrlimit, RLIMIT_STACK, RLIM_INFINITY};
@@ -74,14 +74,16 @@ fn tempdir(temp_dir: &Path) -> io::Result<PathBuf> {
 fn prepare_mount(base_dir: &Path, temp_dir: &Path, overlay: bool) -> Result<(), Error> {
     let root_dir = temp_dir.join("root");
     let sand_dir = root_dir.join("sand");
-    create_dir(&root_dir)?;
-    create_dir(&sand_dir)?;
+    create_dir(&root_dir).context("failed to create root_dir")?;
+    create_dir(&sand_dir).context("failed to create sand_dir")?;
 
     if overlay {
-        let work_dir = tempdir(&temp_dir)?;
-        let upper_dir = tempdir(&temp_dir)?;
-        set_permissions(&work_dir, PermissionsExt::from_mode(0o777))?;
-        set_permissions(&upper_dir, PermissionsExt::from_mode(0o777))?;
+        let work_dir = tempdir(&temp_dir).context("failed to create temporary work_dir")?;
+        let upper_dir = tempdir(&temp_dir).context("failed to create temporary upper_dir")?;
+        set_permissions(&work_dir, PermissionsExt::from_mode(0o777))
+            .context("failed to set permissions of work_dir")?;
+        set_permissions(&upper_dir, PermissionsExt::from_mode(0o777))
+            .context("failed to set permissions of upper_dir")?;
         let option = format!(
             "lowerdir={},upperdir={},workdir={}",
             "./",
@@ -94,7 +96,8 @@ fn prepare_mount(base_dir: &Path, temp_dir: &Path, overlay: bool) -> Result<(), 
             Some("overlay"),
             MsFlags::empty(),
             Some(&option[..]),
-        )?;
+        )
+        .context("failed to overlay mount sand_dir")?;
     } else {
         // mount --bind ./ tempdir
         mount(
@@ -103,22 +106,25 @@ fn prepare_mount(base_dir: &Path, temp_dir: &Path, overlay: bool) -> Result<(), 
             None::<&str>,
             MsFlags::MS_BIND,
             None::<&str>,
-        )?;
+        )
+        .context("failed to mount sand_dir")?;
     }
 
     // make /tmp
-    create_dir(root_dir.join("tmp"))?;
-    set_permissions(&root_dir.join("tmp"), PermissionsExt::from_mode(0o777))?;
+    create_dir(root_dir.join("tmp")).context("failed to create root_dir/tmp")?;
+    set_permissions(&root_dir.join("tmp"), PermissionsExt::from_mode(0o777))
+        .context("failed to set permissions of root_dir/tmp")?;
     // mount -t proc proc /proc
     let proc_dir = root_dir.join("proc");
-    create_dir(&proc_dir)?;
+    create_dir(&proc_dir).context("failed to create proc_dir")?;
     mount(
         Some("proc"),
         &proc_dir,
         Some("proc"),
         MsFlags::empty(),
         None::<&str>,
-    )?;
+    )
+    .context("failed to mount proc_dir")?;
     // mount files
     for dir_name in vec![
         "dev", "sys", "bin", "sbin", "lib", "lib64", "usr", "etc", "opt", "var", "home",
@@ -131,7 +137,8 @@ fn prepare_mount(base_dir: &Path, temp_dir: &Path, overlay: bool) -> Result<(), 
             None::<&str>,
             MsFlags::MS_BIND | MsFlags::MS_RDONLY,
             None::<&str>,
-        )?;
+        )
+        .context("failed to mount some directories in root_dir")?;
     }
     Ok(())
 }
@@ -145,10 +152,12 @@ fn prepare_mount(_: &Path, _: &Path, _: bool) -> Result<(), Error> {
 fn prepare_cgroup(pid: &Pid) -> Result<(), Error> {
     Command::new("cgdelete")
         .arg("pids,cpuset,memory:/lib-judge")
-        .status()?;
+        .status()
+        .context("failed to cgdelete")?;
     if !Command::new("cgcreate")
         .args(&["-g", "pids,cpuset,memory:/lib-judge"])
-        .status()?
+        .status()
+        .context("failed to cgcreate")?
         .success()
     {
         return Err(format_err!("failed cgcreate"));
@@ -156,29 +165,33 @@ fn prepare_cgroup(pid: &Pid) -> Result<(), Error> {
     fn cgset(arg: &str) -> Result<(), Error> {
         if !Command::new("cgset")
             .args(&["-r", arg, "/lib-judge"])
-            .status()?
+            .status()
+            .context("failed to cgset")?
             .success()
         {
             return Err(format_err!("failed cgset pids.max"));
         }
         Ok(())
     }
-    cgset("pids.max=1000")?;
-    cgset("cpuset.cpus=0")?;
-    cgset("cpuset.mems=0")?;
-    cgset("memory.limit_in_bytes=1G")?;
-    cgset("memory.memsw.limit_in_bytes=1G")?;
+    cgset("pids.max=1000").context("failed to cgset pids.max=1000")?;
+    cgset("cpuset.cpus=0").context("failed to cgset cpuset.cpus=0")?;
+    cgset("cpuset.mems=0").context("failed to cgset cpuset.mems=0")?;
+    cgset("memory.limit_in_bytes=1G").context("faled to cgset memory.limit_in_bytes=1G")?;
+    cgset("memory.memsw.limit_in_bytes=1G")
+        .context("failed to cgset memory.memsw.limit_in_bytes=1G")?;
     fn cgexec(group: &str, pid: &Pid) -> Result<(), Error> {
         let mut file = OpenOptions::new()
             .write(true)
             .truncate(true)
-            .open(format!("/sys/fs/cgroup/{}/lib-judge/cgroup.procs", group))?;
-        file.write((pid.as_raw().to_string() + "\n").as_bytes())?;
+            .open(format!("/sys/fs/cgroup/{}/lib-judge/cgroup.procs", group))
+            .context("failed to open cgroup.procs")?;
+        file.write((pid.as_raw().to_string() + "\n").as_bytes())
+            .context("failed to write to cgroup.procs")?;
         Ok(())
     }
-    cgexec("pids", &pid)?;
-    cgexec("cpuset", &pid)?;
-    cgexec("memory", &pid)?;
+    cgexec("pids", &pid).context("failed to cgexec pids")?;
+    cgexec("cpuset", &pid).context("failed to cgexec cpuset")?;
+    cgexec("memory", &pid).context("failed to cgexec memory")?;
     Ok(())
 }
 
@@ -191,20 +204,30 @@ fn prepare_cgroup(_: &Pid) -> Result<(), Error> {
 fn change_uid() -> Result<(), Error> {
     let output = Command::new("id")
         .args(&["-g", "library-checker-user"])
-        .output()?;
+        .output()
+        .context("failed to id -g")?;
     if !output.status.success() {
         return Err(format_err!("failed: id -g library-checker-user"));
     }
-    let gid = String::from_utf8(output.stdout)?.trim().parse()?;
-    setgid(Gid::from_raw(gid))?;
+    let gid = String::from_utf8(output.stdout)
+        .context("failed to convert string from utf8")?
+        .trim()
+        .parse()
+        .context("failed to parse")?;
+    setgid(Gid::from_raw(gid)).context("failed to setgid")?;
     let output = Command::new("id")
         .args(&["-u", "library-checker-user"])
-        .output()?;
+        .output()
+        .context("failed to id -u")?;
     if !output.status.success() {
         return Err(format_err!("failed: id -u library-checker-user"));
     }
-    let uid = String::from_utf8(output.stdout)?.trim().parse()?;
-    setuid(Uid::from_raw(uid))?;
+    let uid = String::from_utf8(output.stdout)
+        .context("failed to convert string from utf8")?
+        .trim()
+        .parse()
+        .context("failed to parse")?;
+    setuid(Uid::from_raw(uid)).context("failed to setuid")?;
 
     Ok(())
 }
@@ -222,8 +245,8 @@ fn execute_unshared(
 ) -> Result<(), Error> {
     let base_dir = Path::new(app.value_of("cwd").unwrap_or("."));
     let overlay: bool = app.is_present("overlay");
-    prepare_mount(&base_dir, &temp_dir, overlay)?;
-    prepare_cgroup(&getpid())?;
+    prepare_mount(&base_dir, &temp_dir, overlay).context("failed to prepare_mount")?;
+    prepare_cgroup(&getpid()).context("failed to prepare_cgroup")?;
     unsafe {
         let res = setrlimit(
             RLIMIT_STACK,
@@ -242,19 +265,21 @@ fn execute_unshared(
     }
 
     if cfg!(feature = "sandbox") {
-        chdir(&temp_dir.join("root").join("sand"))?;
+        chdir(&temp_dir.join("root").join("sand"))
+            .context("failed to chdir to temp_dir/root/sand")?;
     } else {
-        chdir(base_dir)?;
+        chdir(base_dir).context("failed to chdir to base_dir")?;
     }
 
     if cfg!(feature = "sandbox") {
-        chroot("..")?;
-        change_uid()?;
+        chroot("..").context("failed to chroot to ..")?;
+        change_uid().context("failed to change_uid")?;
         env::remove_var("TMPDIR");
         env::set_var("HOME", "/home/library-checker-user");
     }
 
-    let program = CString::new(user_args[0].clone())?;
+    let program =
+        CString::new(user_args[0].clone()).context("failed to convert user_args[0] to CString")?;
     let args: Vec<std::ffi::CString> = user_args[..]
         .iter()
         .map(|s| CString::new(s.clone()).unwrap())
@@ -262,32 +287,32 @@ fn execute_unshared(
     let args: Vec<&std::ffi::CStr> = args.iter().map(|s| &s[..]).collect();
 
     if let Some(stdin) = app.value_of("stdin") {
-        let fd_in = open(stdin, OFlag::O_RDONLY, Mode::empty())?;
-        dup2(fd_in, 0)?;
-        close(fd_in)?;
+        let fd_in = open(stdin, OFlag::O_RDONLY, Mode::empty()).context("failed to open fd_in")?;
+        dup2(fd_in, 0).context("failed to dup2 stdin")?;
+        close(fd_in).context("failed to close fd_in")?;
     }
     if let Some(stdout) = app.value_of("stdout") {
         let fd_out = open(
             stdout,
             OFlag::O_WRONLY | OFlag::O_TRUNC | OFlag::O_CREAT,
             Mode::S_IRUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IWUSR,
-        )?;
-        dup2(fd_out, 1)?;
-        close(fd_out)?;
+        ).context("failed to open fd_out")?;
+        dup2(fd_out, 1).context("failed to dup2 stdout")?;
+        close(fd_out).context("failed to close fd_out")?;
     }
     if let Some(stderr) = app.value_of("stderr") {
         let fd_err = open(
             stderr,
             OFlag::O_WRONLY | OFlag::O_TRUNC | OFlag::O_CREAT,
             Mode::S_IRUSR | Mode::S_IRGRP | Mode::S_IWGRP | Mode::S_IWUSR,
-        )?;
-        dup2(fd_err, 2)?;
-        close(fd_err)?;
+        ).context("failed to open fd_err")?;
+        dup2(fd_err, 2).context("failed to dup2 fd_err")?;
+        close(fd_err).context("failed to close fd_err")?;
     }
 
-    write(start_pipe_write, &[0])?;
-    close(start_pipe_write)?;
-    execvp(&program, &args[..])?;
+    write(start_pipe_write, &[0]).context("failed to write to start_pipe")?;
+    close(start_pipe_write).context("failed to close start_pipe")?;
+    execvp(&program, &args[..]).context("failed to execvp program")?;
     Ok(())
 }
 
@@ -301,7 +326,8 @@ pub struct ExecResult {
 
 #[cfg(feature = "sandbox")]
 fn sandbox_unshare() -> Result<(), Error> {
-    unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWNET)?;
+    unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWNET)
+        .context("failed to unshare")?;
     Ok(())
 }
 
@@ -318,21 +344,24 @@ fn sandbox_mount() -> Result<(), Error> {
         None::<&str>,
         MsFlags::MS_REC | MsFlags::MS_PRIVATE,
         None::<&str>,
-    )?;
+    )
+    .context("failed to mount /")?;
     mount(
         Some("none"),
         "/proc",
         None::<&str>,
         MsFlags::MS_PRIVATE | MsFlags::MS_REC,
         None::<&str>,
-    )?;
+    )
+    .context("failed to mount none to /proc")?;
     mount(
         Some("proc"),
         "/proc",
         Some("proc"),
         MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
         None::<&str>,
-    )?;
+    )
+    .context("failed to mount proc to /proc")?;
     Ok(())
 }
 
@@ -342,22 +371,25 @@ fn sandbox_mount() -> Result<(), Error> {
 }
 
 fn execute(app: &clap::ArgMatches, user_args: &[String]) -> Result<ExecResult, Error> {
-    let temp_dir = tempdir(&std::env::temp_dir())?;
-    let (pipe_read, pipe_write) = pipe()?;
-    let (start_pipe_read, start_pipe_write) = pipe()?;
+    let temp_dir = tempdir(&std::env::temp_dir()).context("failed to create temp_dir")?;
+    let (pipe_read, pipe_write) = pipe().context("failed to create pipe")?;
+    let (start_pipe_read, start_pipe_write) = pipe().context("failed to create start_pipe")?;
     info!("working dir: {:?}", temp_dir);
-    set_permissions(&temp_dir, PermissionsExt::from_mode(0o777))?;
-    match fork()? {
+    set_permissions(&temp_dir, PermissionsExt::from_mode(0o777))
+        .context("failed to set permissions of temp_dir")?;
+    match fork().context("failed to fork")? {
         ForkResult::Child => {
-            close(pipe_read)?;
-            close(start_pipe_read)?;
+            close(pipe_read).context("failed to close pipe (in forked child)")?;
+            close(start_pipe_read).context("failed to close start_pipe (in forked child)")?;
 
-            sandbox_unshare().expect("failed unshare");
+            sandbox_unshare().expect("failed unshare (in forked child)");
 
-            match fork()? {
+            match fork().context("failed to fork (in forked child)")? {
                 ForkResult::Child => {
-                    close(pipe_write)?;
-                    sandbox_mount()?;
+                    close(pipe_write)
+                        .context("failed to close pipe (in forked child in forked child)")?;
+                    sandbox_mount()
+                        .context("failed to sandbox_mount (in forked child in forked child)")?;
                     exit(
                         match execute_unshared(app, &temp_dir, user_args, start_pipe_write) {
                             Ok(()) => 0,
@@ -369,28 +401,33 @@ fn execute(app: &clap::ArgMatches, user_args: &[String]) -> Result<ExecResult, E
                     )
                 }
                 ForkResult::Parent { child, .. } => {
-                    close(start_pipe_write)?;
-                    write(pipe_write, &child.as_raw().to_le_bytes())?;
-                    match waitpid(child, None)? {
+                    close(start_pipe_write)
+                        .context("failed to close start_pipe (in forked parent in forked child)")?;
+                    write(pipe_write, &child.as_raw().to_le_bytes())
+                        .context("failed to write pipe (in forked parent in forked child)")?;
+                    match waitpid(child, None)
+                        .context("failed to waitpid child (in forked parent in forked child)")?
+                    {
                         WaitStatus::Exited(_, status) => {
-                            write(pipe_write, &status.to_le_bytes())?;
+                            write(pipe_write, &status.to_le_bytes()).context("failed to write pipe when child was exited (in forked parent in forked child)")?;
                         }
                         WaitStatus::Signaled(_, status, _) => {
-                            write(pipe_write, &(status as i32).to_le_bytes())?;
+                            write(pipe_write, &(status as i32).to_le_bytes()).context("failed to write pipe when child is signaled (in forked parent in forked child)")?;
                         }
                         _ => {
                             warn!("failed waitpid");
                             return Err(format_err!("waitpid: unusual return value"));
                         }
                     }
-                    close(pipe_write)?;
+                    close(pipe_write)
+                        .context("failed to close pipe (in forked parent in forked child)")?;
                 }
             }
             exit(0);
         }
         ForkResult::Parent { child, .. } => {
-            close(pipe_write)?;
-            close(start_pipe_write)?;
+            close(pipe_write).context("failed to close pipe (in forked parent)")?;
+            close(start_pipe_write).context("failed to close start_pipe (in forked parent)")?;
             let tl: f64 = app
                 .value_of("timelimit")
                 .unwrap_or("3600")
@@ -398,14 +435,16 @@ fn execute(app: &clap::ArgMatches, user_args: &[String]) -> Result<ExecResult, E
                 .expect("--tl must be f64");
             let tl_msec = (tl * 1000.0) as u64;
             let mut buf = [0; size_of::<pid_t>()];
-            let size = read(pipe_read, &mut buf[..])?;
+            let size =
+                read(pipe_read, &mut buf[..]).context("failed to read pipe (in forked parent)")?;
             if size == 0 {
                 return Err(format_err!("pipe broken: unshared may be failed"));
             }
             let inside: i32 = pid_t::from_le_bytes(buf);
             let tle = Arc::new(AtomicBool::new(false));
             let tle_clone = tle.clone();
-            read(start_pipe_read, &mut [0])?;
+            read(start_pipe_read, &mut [0])
+                .context("failed to read start_pipe (in forked parent)")?;
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(tl_msec + 200));
                 match kill(Pid::from_raw(inside), SIGKILL) {
@@ -416,7 +455,7 @@ fn execute(app: &clap::ArgMatches, user_args: &[String]) -> Result<ExecResult, E
                 }
             });
             let start = Instant::now();
-            match waitpid(child, None)? {
+            match waitpid(child, None).context("failed to waitpid child (in forked parent)")? {
                 WaitStatus::Exited(_, status) => {
                     if status != 0 {
                         return Err(format_err!("execute failed {:?}", status));
@@ -427,9 +466,10 @@ fn execute(app: &clap::ArgMatches, user_args: &[String]) -> Result<ExecResult, E
                 }
             }
             let time = start.elapsed().as_secs_f64();
-            remove_dir_all(&temp_dir)?;
+            remove_dir_all(&temp_dir)
+                .context("failed to remove_dir_all temp_dir (in forked parent)")?;
             let mut buf = [0; size_of::<i32>()];
-            read(pipe_read, &mut buf[..])?;
+            read(pipe_read, &mut buf[..]).context("failed to read pipe (in forked parent)")?;
             let mut result = ExecResult {
                 status: 0,
                 time: -1.0,
@@ -444,8 +484,13 @@ fn execute(app: &clap::ArgMatches, user_args: &[String]) -> Result<ExecResult, E
             }
             result.memory = if cfg!(feature = "sandbox") {
                 let mem =
-                    read_to_string("/sys/fs/cgroup/memory/lib-judge/memory.max_usage_in_bytes")?;
-                mem.trim().parse()?
+                    read_to_string("/sys/fs/cgroup/memory/lib-judge/memory.max_usage_in_bytes")
+                        .context(
+                            "failed to read cgroup memory.max_usage_in_bytes (in forked parent)",
+                        )?;
+                mem.trim()
+                    .parse()
+                    .context("failed to parse mem.trim() (in forked parent)")?
             } else {
                 0
             };
@@ -505,15 +550,16 @@ pub fn execute_main(my_args: &[String], user_args: &[String]) -> Result<ExecResu
         warn!("invalid timelimit: {}", tl);
         panic!();
     }
-    let result = execute(&matches, user_args)?;
+    let result = execute(&matches, user_args).context("failed to execute")?;
     info!("result: {:?}", result);
     if let Some(result_file) = matches.value_of("result") {
-        let mut file = File::create(result_file)?;
+        let mut file = File::create(result_file).context("failed to create result_file")?;
         writeln!(
             file,
             "{{\"returncode\": {}, \"time\": {}, \"memory\": {}, \"tle\": {}}}",
             result.status, result.time, result.memory, result.tle
-        )?;
+        )
+        .context("failed to write to result_file")?;
     }
 
     Ok(result)
